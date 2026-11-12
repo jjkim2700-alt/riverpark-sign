@@ -948,27 +948,6 @@ function submitSignature() {
     }
   });
 }
-
-  fetch('/api/sign', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ rep_id: repId, pin: pin, signature: sigImg })
-  })
-  .then(r => r.json())
-  .then(res => {
-    if (res.error) {
-      alert('오류: ' + res.error);
-    } else {
-      const resDiv = document.getElementById('sign-result');
-      resDiv.style.display = 'block';
-      resDiv.style.background = '#ECFDF5';
-      resDiv.style.color = '#065F46';
-      resDiv.innerText = '✓ 전자서명이 정상적으로 등록 완료되었습니다. 감사합니다!';
-      loadPublicData();
-      alert('✓ 전자서명이 정상적으로 등록되었습니다!');
-    }
-  });
-}
 </script>
 
 </body>
