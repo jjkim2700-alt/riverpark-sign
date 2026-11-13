@@ -33,10 +33,12 @@ def get_local_ip():
     return ip
 
 LOCAL_IP = get_local_ip()
+RENDER_URL = os.environ.get('RENDER_EXTERNAL_URL', '')
+DEFAULT_URL = RENDER_URL if RENDER_URL else f"http://{LOCAL_IP}:{PORT}"
 
 INITIAL_STATE = {
     "admin_password": "1234",
-    "server_url": f"http://{LOCAL_IP}:{PORT}",
+    "server_url": DEFAULT_URL,
     "meeting": {
         "title": "청주리버파크자이 제4기 제1차 비상 입주자대표회의",
         "date": "2026년 11월 20일 (금) 19:30",
@@ -91,8 +93,12 @@ def load_data():
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            if "server_url" not in data:
-                data["server_url"] = f"http://{LOCAL_IP}:{PORT}"
+            if "server_url" not in data or "10." in data.get("server_url", "") or "172.16." in data.get("server_url", ""):
+                render_url = os.environ.get('RENDER_EXTERNAL_URL')
+                if render_url:
+                    data["server_url"] = render_url
+                else:
+                    data["server_url"] = DEFAULT_URL
             if "admin_password" not in data:
                 data["admin_password"] = "1234"
             return data
@@ -261,6 +267,12 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+    def do_HEAD(self):
+        # Render health checks use HEAD requests to test if the service is alive
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+
     def check_admin_auth(self, req_json):
         # Admin auth check via header or request payload
         pw_header = self.headers.get('X-Admin-Password')
@@ -372,13 +384,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_len).decode('utf-8')
         req = json.loads(body) if body else {}
 
-        # Public: Set PIN for rep
+        # Public: Set/Change PIN for rep
         if parsed.path == '/api/set-pin':
             rep_id = req.get('rep_id')
             new_pin = req.get('new_pin')
             old_pin = req.get('old_pin')
             
-            if not new_pin or len(new_pin) < 4:
+            if not new_pin or len(str(new_pin)) < 4:
                 self.send_json_error('비밀번호는 최소 4자리 이상이어야 합니다.')
                 return
 
@@ -386,8 +398,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             found = False
             for rep in data['reps']:
                 if rep['id'] == rep_id:
-                    if rep.get('pin') and rep['pin'] != old_pin:
-                        self.send_json_error('기존 비밀번호가 일치하지 않습니다.')
+                    default_pin = rep.get('phone', '').replace('-', '')[-4:] if rep.get('phone') else '0000'
+                    expected_current_pin = str(rep.get('pin') or default_pin)
+                    if str(old_pin) != expected_current_pin:
+                        self.send_json_error('현재 비밀번호가 일치하지 않습니다. (초기 비밀번호: 관리소 등록 휴대폰 뒷 4자리)')
                         return
                     rep['pin'] = str(new_pin)
                     found = True
@@ -395,7 +409,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             
             if found:
                 save_data(data)
-                self.send_json_success({'message': '개인 PIN 번호가 성공적으로 설정되었습니다.'})
+                self.send_json_success({'message': '개인 비밀번호가 성공적으로 변경되었습니다.'})
             else:
                 self.send_json_error('해당 동대표를 찾을 수 없습니다.')
 
@@ -403,17 +417,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif parsed.path == '/api/sign':
             rep_id = req.get('rep_id')
             signature = req.get('signature')
-            pin = req.get('pin')
+            pin = str(req.get('pin', '')).strip()
             
             data = load_data()
             found = False
             for rep in data['reps']:
                 if rep['id'] == rep_id:
-                    if not rep.get('pin'):
-                        self.send_json_error('먼저 본인만의 개인 PIN 번호를 설정해주세요.')
-                        return
-                    if str(rep['pin']) != str(pin):
-                        self.send_json_error('PIN 번호가 일치하지 않습니다. 본인이 설정한 번호를 입력하세요.')
+                    default_pin = rep.get('phone', '').replace('-', '')[-4:] if rep.get('phone') else '0000'
+                    expected_pin = str(rep.get('pin') or default_pin)
+                    if pin != expected_pin:
+                        self.send_json_error('본인확인 비밀번호가 일치하지 않습니다. (초기 비밀번호: 관리소에 등록된 본인 휴대폰 번호 뒷 4자리)')
                         return
                     
                     rep['signed'] = True
@@ -673,26 +686,17 @@ USER_HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div style="font-size:1.05rem; font-weight:700; color:#1E3A8A; margin-top:2px;" id="signer-locked-name"></div>
     </div>
 
-    <!-- PIN Setup for First-time user -->
-    <div id="pin-setup-box" style="display:none; background:#FFFBEB; border:1px solid #FCD34D; padding:12px; border-radius:8px; margin-bottom:12px;">
-      <div style="font-weight:700; font-size:0.85rem; color:#B45309; margin-bottom:4px;">🔐 최초 1회 개인 비밀번호(PIN) 직접 설정</div>
-      <div style="font-size:0.78rem; color:#78350F; margin-bottom:8px;">다른 사람이 대리 서명할 수 없도록, 본인만 아는 4~6자리 비밀번호를 설정하세요.</div>
-      <div style="display:flex; gap:6px;">
-        <input type="password" id="new-pin-input" placeholder="새 비밀번호 (4~6자리)" class="form-input" style="flex:2;" maxlength="6" inputmode="numeric">
-        <button onclick="saveNewPin()" style="background:#B45309; color:white; border:none; padding:8px 12px; border-radius:8px; font-weight:700; cursor:pointer; flex:1;">
-          설정 완료
+    <!-- PIN Entry for Phone-backed Verification -->
+    <div id="pin-entry-box" class="form-group">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+        <label class="form-label" style="margin:0;">본인확인 비밀번호 (PIN):</label>
+        <button type="button" onclick="promptChangePin()" style="background:#F1F5F9; border:1px solid #CBD5E1; border-radius:6px; padding:3px 8px; font-size:0.75rem; color:#475569; cursor:pointer;">
+          🔑 비밀번호 변경
         </button>
       </div>
-    </div>
-
-    <!-- PIN Entry for Existing PIN -->
-    <div id="pin-entry-box" class="form-group">
-      <label class="form-label">본인확인 개인 비밀번호 (PIN):</label>
-      <div style="display:flex; gap:6px;">
-        <input type="password" id="signer-pin" placeholder="본인이 설정한 비밀번호 입력" class="form-input" maxlength="6" inputmode="numeric">
-        <button onclick="promptChangePin()" style="background:#F1F5F9; border:1px solid #CBD5E1; border-radius:8px; padding:0 10px; font-size:0.75rem; color:#475569; cursor:pointer; white-space:nowrap;">
-          비번 변경
-        </button>
+      <input type="password" id="signer-pin" placeholder="초기: 관리소 등록 휴대폰 번호 뒷 4자리" class="form-input" maxlength="6" inputmode="numeric">
+      <div style="font-size:0.75rem; color:#64748B; margin-top:5px; line-height:1.4;">
+        ※ 대리 서명 방지를 위해 초기 비밀번호는 <strong>관리소에 등록된 동대표님의 휴대폰 번호 뒷 4자리</strong>로 설정되어 있습니다. (변경 원할 시 우측 상단 '비밀번호 변경' 클릭)
       </div>
     </div>
 
@@ -800,24 +804,20 @@ function onSignerChange() {
   if (!rep) return;
 
   const pinBadge = document.getElementById('pin-badge');
-  const setupBox = document.getElementById('pin-setup-box');
-  const entryBox = document.getElementById('pin-entry-box');
   const pinInput = document.getElementById('signer-pin');
 
-  if (!rep.has_pin) {
-    pinBadge.innerText = '비밀번호 미설정 (최초)';
-    pinBadge.style.background = '#FEF3C7';
-    pinBadge.style.color = '#B45309';
-    setupBox.style.display = 'block';
-    entryBox.style.display = 'none';
+  if (rep.has_pin) {
+    pinBadge.innerText = '🔒 나만의 비번 사용 중';
+    pinBadge.style.background = '#ECFDF5';
+    pinBadge.style.color = '#065F46';
+    pinInput.placeholder = '설정한 개인 비밀번호 입력';
   } else {
-    pinBadge.innerText = '개인 비밀번호 보호 중';
-    pinBadge.style.background = '#D1FAE5';
-    pinBadge.style.color = '#059669';
-    setupBox.style.display = 'none';
-    entryBox.style.display = 'block';
-    pinInput.value = '';
+    pinBadge.innerText = '📱 휴대폰 뒷 4자리 보호';
+    pinBadge.style.background = '#EFF6FF';
+    pinBadge.style.color = '#1D4ED8';
+    pinInput.placeholder = '초기: 관리소 등록 휴대폰 번호 뒷 4자리';
   }
+  pinInput.value = '';
 
   if (rep.signed) {
     resDiv.style.display = 'block';
@@ -827,38 +827,18 @@ function onSignerChange() {
   }
 }
 
-function saveNewPin() {
-  const selId = lockedRepId || document.getElementById('signer-select').value;
-  const newPin = document.getElementById('new-pin-input').value.trim();
-  if (newPin.length < 4) {
-    alert('비밀번호는 최소 4자리 이상 입력해주세요.');
-    return;
-  }
-
-  fetch('/api/set-pin', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ rep_id: selId, new_pin: newPin })
-  })
-  .then(r => r.json())
-  .then(res => {
-    if (res.error) alert('오류: ' + res.error);
-    else {
-      alert('비밀번호가 성공적으로 설정되었습니다! 이제 서명란에 서명 후 제출하세요.');
-      loadPublicData();
-    }
-  });
-}
-
 function promptChangePin() {
-  const oldPin = prompt('현재 사용 중인 비밀번호를 입력하세요:');
+  const selId = lockedRepId || document.getElementById('signer-select').value;
+  const rep = state.reps.find(r => r.id === selId);
+  const repName = rep ? rep.name : '동대표';
+  
+  const oldPin = prompt(`[${repName} 대표님 비밀번호 변경]\n현재 사용 중인 비밀번호를 입력하세요:\n(※ 변경한 적이 없다면 관리소 등록 휴대폰 번호 뒷 4자리)`);
   if (!oldPin) return;
-  const newPin = prompt('새로 변경할 비밀번호(4~6자리)를 입력하세요:');
+  const newPin = prompt('새로 변경할 나만의 비밀번호(4~6자리 숫자)를 입력하세요:');
   if (!newPin || newPin.length < 4) {
-    alert('비밀번호는 최소 4자리 이상이어야 합니다.');
+    alert('새 비밀번호는 최소 4자리 이상이어야 합니다.');
     return;
   }
-  const selId = lockedRepId || document.getElementById('signer-select').value;
   fetch('/api/set-pin', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -867,7 +847,11 @@ function promptChangePin() {
   .then(r => r.json())
   .then(res => {
     if (res.error) alert('오류: ' + res.error);
-    else alert('비밀번호가 성공적으로 변경되었습니다!');
+    else {
+      alert('✓ 비밀번호가 성공적으로 변경되었습니다!\n이제 새 비밀번호로 서명하실 수 있습니다.');
+      document.getElementById('signer-pin').value = newPin;
+      loadPublicData();
+    }
   });
 }
 
@@ -1080,6 +1064,12 @@ ADMIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
   .rep-table th { background: #F1F5F9; padding: 8px; text-align: left; border-bottom: 2px solid #CBD5E1; color: #334155; }
   .rep-table td { padding: 8px; border-bottom: 1px solid #E2E8F0; vertical-align: middle; }
   .rep-input { padding: 6px 8px; border: 1px solid #CBD5E1; border-radius: 6px; width: 100%; font-size: 0.85rem; }
+  
+  @keyframes syncPulse {
+    0% { transform: scale(0.9); opacity: 0.7; }
+    50% { transform: scale(1.3); opacity: 1; }
+    100% { transform: scale(0.9); opacity: 0.7; }
+  }
 </style>
 </head>
 <body>
@@ -1089,18 +1079,22 @@ ADMIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="brand-title">청주리버파크자이 관리자 대시보드</div>
     <div style="font-size:0.75rem; opacity:0.85;">입주자대표회의 전자서명 관리 센터</div>
   </div>
-  <div style="display:flex; align-items:center; gap:8px;">
+  <div style="display:flex; align-items:center; gap:10px;">
+    <span id="sync-indicator" style="display:inline-flex; align-items:center; gap:6px; font-size:0.75rem; background:rgba(16,185,129,0.25); color:#A7F3D0; padding:4px 10px; border-radius:20px; border:1px solid rgba(16,185,129,0.5);">
+      <span style="width:7px; height:7px; background:#10B981; border-radius:50%; display:inline-block; animation:syncPulse 1.8s infinite;"></span>
+      실시간 동기화 중 (3초)
+    </span>
     <span class="badge-admin">관리자 모드</span>
     <button onclick="logoutAdmin()" class="btn-sm" style="background:rgba(255,255,255,0.2); color:white;">로그아웃</button>
   </div>
 </header>
 
-<!-- Admin Login Overlay -->
-<div id="login-overlay" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(15,56,117,0.92); z-index:2000; display:flex; align-items:center; justify-content:center;">
+<!-- Admin Login Overlay (Hidden by default, displayed only if no 1-hour session) -->
+<div id="login-overlay" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(15,56,117,0.92); z-index:2000; align-items:center; justify-content:center;">
   <div style="background:white; border-radius:14px; padding:28px 24px; max-width:380px; width:90%; text-align:center; box-shadow:0 10px 25px rgba(0,0,0,0.3);">
     <h3 style="color:var(--primary); margin-bottom:6px;">🔒 관리자 인증</h3>
-    <p style="font-size:0.82rem; color:#64748B; margin-bottom:16px;">관리자 마스터 비밀번호를 입력하세요.<br>(초기 비밀번호: 1234)</p>
-    <input type="password" id="admin-pw-input" placeholder="비밀번호 입력" class="form-input" style="text-align:center; font-size:1.1rem; letter-spacing:2px; margin-bottom:12px;">
+    <p style="font-size:0.82rem; color:#64748B; margin-bottom:16px;">관리자 마스터 비밀번호를 입력하세요.<br>(초기 비밀번호: 1234 / 1시간 로그인 유지)</p>
+    <input type="password" id="admin-pw-input" placeholder="비밀번호 입력" class="form-input" style="text-align:center; font-size:1.1rem; letter-spacing:2px; margin-bottom:12px;" onkeydown="if(event.key==='Enter')loginAdmin()">
     <button onclick="loginAdmin()" class="btn-action-main" style="padding:10px;">관리자 로그인</button>
   </div>
 </div>
@@ -1286,14 +1280,41 @@ ADMIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <script>
 let state = null;
-let adminPw = sessionStorage.getItem('admin_token') || '';
 let editingReps = [];
+let pollTimer = null;
+
+function getSavedAdminPw() {
+  try {
+    const raw = localStorage.getItem('rp_admin_session');
+    if (!raw) return '';
+    const obj = JSON.parse(raw);
+    if (!obj.token || Date.now() > obj.expiresAt) {
+      localStorage.removeItem('rp_admin_session');
+      return '';
+    }
+    return obj.token;
+  } catch (e) {
+    return '';
+  }
+}
+
+function saveAdminPw(pw) {
+  const expiresAt = Date.now() + 60 * 60 * 1000; // 1 hour session
+  localStorage.setItem('rp_admin_session', JSON.stringify({ token: pw, expiresAt: expiresAt }));
+}
+
+function clearAdminPw() {
+  localStorage.removeItem('rp_admin_session');
+}
+
+let adminPw = getSavedAdminPw();
 
 window.onload = function() {
   if (!adminPw) {
     document.getElementById('login-overlay').style.display = 'flex';
   } else {
     loadAdminData();
+    startAutoPolling();
   }
 };
 
@@ -1312,25 +1333,29 @@ function loginAdmin() {
       alert('오류: ' + res.error);
     } else {
       adminPw = pw;
-      sessionStorage.setItem('admin_token', adminPw);
+      saveAdminPw(adminPw);
       document.getElementById('login-overlay').style.display = 'none';
       loadAdminData();
+      startAutoPolling();
     }
   });
 }
 
 function logoutAdmin() {
-  sessionStorage.removeItem('admin_token');
+  if (pollTimer) clearInterval(pollTimer);
+  clearAdminPw();
   window.location.reload();
 }
 
-function loadAdminData() {
+function loadAdminData(silent = false) {
+  if (!adminPw) return;
   fetch('/api/admin-data', {
     headers: { 'X-Admin-Password': adminPw }
   })
   .then(r => {
     if (r.status === 401) {
-      sessionStorage.removeItem('admin_token');
+      clearAdminPw();
+      if (pollTimer) clearInterval(pollTimer);
       document.getElementById('login-overlay').style.display = 'flex';
       throw new Error('Unauthorized');
     }
@@ -1338,14 +1363,41 @@ function loadAdminData() {
   })
   .then(data => {
     state = data;
-    document.getElementById('server-url-input').value = state.server_url;
+    const urlInput = document.getElementById('server-url-input');
+    if (urlInput && !urlInput.matches(':focus')) {
+      urlInput.value = getEffectiveUrl();
+    }
     renderAdmin();
   })
-  .catch(e => console.log(e));
+  .catch(e => {
+    if (!silent) console.log(e);
+  });
+}
+
+function startAutoPolling() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(() => {
+    const m1 = document.getElementById('edit-meeting-modal');
+    const m2 = document.getElementById('reps-modal');
+    if ((m1 && m1.style.display === 'flex') || (m2 && m2.style.display === 'flex')) {
+      return; // Do not interrupt admin while editing modals
+    }
+    loadAdminData(true);
+  }, 3000);
 }
 
 function getEffectiveUrl() {
-  return (state && state.server_url) ? state.server_url : window.location.origin;
+  // If accessing from a browser on render or web, window.location.origin is always the 100% correct public URL
+  if (window.location.origin && !window.location.origin.includes('127.0.0.1') && !window.location.origin.includes('localhost') && !window.location.origin.includes('10.') && !window.location.origin.includes('172.16.') && !window.location.origin.includes('192.168.')) {
+    return window.location.origin;
+  }
+  if (state && state.server_url) {
+    const u = state.server_url;
+    if (!u.includes('10.') && !u.includes('172.16.') && !u.includes('192.168.') && !u.includes('127.0.0.1') && !u.includes('localhost')) {
+      return u;
+    }
+  }
+  return window.location.origin;
 }
 
 function saveServerUrl() {
@@ -1397,7 +1449,7 @@ function renderAdmin() {
           <div class="rep-header">
             <span class="rep-dong">[${r.dong}] ${r.role}</span>
             <span class="status-tag ${r.signed ? 'status-done' : 'status-pending'}">
-              ${r.signed ? '✓ 서명완료' : (r.has_pin ? '서명대기 (PIN설정됨)' : 'PIN설정 대기')}
+              ${r.signed ? '✓ 서명완료' : (r.has_pin ? '서명대기 (개인PIN)' : '서명대기 (폰 뒷자리)')}
             </span>
           </div>
           <div style="font-size: 1.05rem; font-weight: 700; margin-bottom: 4px;">${r.name}</div>
@@ -1430,7 +1482,7 @@ function renderAdmin() {
 }
 
 function copyPersonalKakao(name, dong, url) {
-  const msg = `[청주리버파크자이 입대의 회의록 모바일 서명]\n\n${dong} ${name} 대표님, 아래 링크를 터치하여 모바일 서명을 마쳐주세요.\n\n${url}\n\n(※ 최초 접속 시 본인만 사용할 비밀번호 4자리 설정 후 서명)`;
+  const msg = `[청주리버파크자이 입대의 회의록 모바일 서명]\n\n${dong} ${name} 대표님, 아래 링크를 터치하여 모바일 서명을 마쳐주세요.\n\n${url}\n\n(※ 초기 비밀번호: 관리소에 등록된 대표님 휴대폰 번호 뒷 4자리)`;
   navigator.clipboard.writeText(msg).then(() => {
     alert(`[${name} 대표님 개인 서명 링크]가 복사되었습니다!\n카카오톡에 붙여넣기(Ctrl+V) 하시면 100% 파란색 링크로 전달됩니다.`);
   });
@@ -1449,7 +1501,7 @@ function copyAllKakaoMessage() {
     msg += `${personalUrl}\n\n`;
   });
   msg += `---------------------------------\n`;
-  msg += `※ 최초 1회 본인만 아는 비밀번호(4자리)를 설정 후 손가락으로 사인하시면 완료됩니다.`;
+  msg += `※ 본인확인 비밀번호: 관리소에 등록된 동대표님의 휴대폰 번호 뒷 4자리 입력 후 서명하시면 완료됩니다.`;
 
   navigator.clipboard.writeText(msg).then(() => {
     alert('전체 동대표 서명 링크 공지문이 클립보드에 복사되었습니다!\n카카오톡 단톡방에 그대로 붙여넣기(Ctrl+V) 하시면 링크가 파란색으로 깔끔하게 걸립니다.');
@@ -1602,7 +1654,7 @@ function removeRepRow(idx) {
 }
 
 function resetRepPin(repId, name) {
-  if (confirm(`'${name}' 동대표의 PIN 비밀번호를 초기화하시겠습니까?\n동대표가 다음 접속 시 새 비밀번호를 직접 설정하게 됩니다.`)) {
+  if (confirm(`'${name}' 동대표의 PIN 비밀번호를 초기화하시겠습니까?\n동대표의 초기 비밀번호(관리소 등록 휴대폰 뒷 4자리)로 즉시 복구됩니다.`)) {
     fetch('/api/reset-rep-pin', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Admin-Password': adminPw },
@@ -1610,7 +1662,7 @@ function resetRepPin(repId, name) {
     })
     .then(r => r.json())
     .then(res => {
-      alert(res.message || '초기화되었습니다.');
+      alert(`'${name}' 동대표의 비밀번호가 관리소 등록 휴대폰 뒷 4자리로 초기화되었습니다.`);
       loadAdminData();
     });
   }
