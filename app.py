@@ -453,7 +453,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_json_error('관리자 비밀번호가 일치하지 않습니다.')
 
         # Below are protected Admin actions
-        elif parsed.path in ['/api/save-meeting', '/api/save-reps', '/api/reset-rep-pin', '/api/reset-rep-sign', '/api/set-server-url', '/api/change-admin-pw', '/api/reset']:
+        elif parsed.path in ['/api/save-meeting', '/api/save-reps', '/api/reset-rep-pin', '/api/reset-rep-sign', '/api/clear-signatures', '/api/reset-all-pins', '/api/set-server-url', '/api/change-admin-pw', '/api/reset']:
             if not self.check_admin_auth(req):
                 self.send_json_error('관리자 권한이 없습니다. (비밀번호 불일치)')
                 return
@@ -468,6 +468,26 @@ class RequestHandler(BaseHTTPRequestHandler):
                 save_data(data)
                 generate_signed_pdf()
                 self.send_json_success({'message': '회의록 내용이 성공적으로 저장 및 반영되었습니다.'})
+
+            elif parsed.path == '/api/clear-signatures':
+                # Reset only signature records, strictly PRESERVING rep roster and their secret PINs!
+                data = load_data()
+                for r in data['reps']:
+                    r['signed'] = False
+                    r['signature'] = None
+                    r['sign_time'] = None
+                    r['ip'] = None
+                save_data(data)
+                generate_signed_pdf()
+                self.send_json_success({'message': '동대표 명단과 비밀번호는 안전하게 유지되며, 서명 날인만 초기화되어 다음 회의 준비가 완료되었습니다.'})
+
+            elif parsed.path == '/api/reset-all-pins':
+                # Reset all custom PINs back to management office phone last 4 digits
+                data = load_data()
+                for r in data['reps']:
+                    r['pin'] = None
+                save_data(data)
+                self.send_json_success({'message': '모든 동대표의 비밀번호가 관리소 등록 휴대폰 뒷 4자리로 일괄 초기화되었습니다.'})
 
             elif parsed.path == '/api/save-reps':
                 new_reps_list = req.get('reps')
@@ -1154,12 +1174,18 @@ ADMIN_HTML_TEMPLATE = r"""<!DOCTYPE html>
       <a href="/api/download-pdf" target="_blank" class="btn-action-main">
         📥 최종 전자서명 완료본 회의록 PDF 다운로드 (감사추적서 포함)
       </a>
-      <div style="display:flex; justify-content:center; gap:12px; margin-top:12px;">
-        <button onclick="promptChangeAdminPw()" style="background:transparent; color:#64748B; border:1px solid #CBD5E1; border-radius:6px; padding:6px 12px; font-size:0.8rem; cursor:pointer;">
-          🔑 관리자 비밀번호 변경
+      <div style="display:flex; justify-content:center; gap:10px; margin-top:14px; flex-wrap:wrap;">
+        <button onclick="clearAllSignaturesOnly()" style="background:#F0FDF4; color:#15803D; border:1px solid #86EFAC; border-radius:8px; padding:9px 16px; font-size:0.85rem; font-weight:700; cursor:pointer; box-shadow:0 2px 6px rgba(21,128,61,0.15);" title="명단과 각자 설정한 비밀번호는 보존하고, 서명날인만 비워 다음 회의를 준비합니다.">
+          📝 [다음 회의 준비] 서명(날인)만 일괄 초기화 (비번/명단 유지)
         </button>
-        <button onclick="resetAll()" style="background:transparent; color:#EF4444; border:1px solid #FCA5A5; border-radius:6px; padding:6px 12px; font-size:0.8rem; cursor:pointer;">
-          🔄 전체 서명 데이터 초기화
+        <button onclick="resetAllPins()" style="background:#FFFBEB; color:#B45309; border:1px solid #FCD34D; border-radius:8px; padding:9px 14px; font-size:0.85rem; font-weight:600; cursor:pointer;" title="모든 동대표의 비밀번호를 관리소 등록 휴대폰 뒷 4자리로 일괄 복구합니다.">
+          🔐 동대표 비밀번호 전체 초기화
+        </button>
+        <button onclick="promptChangeAdminPw()" style="background:transparent; color:#64748B; border:1px solid #CBD5E1; border-radius:8px; padding:9px 12px; font-size:0.8rem; cursor:pointer;">
+          🔑 관리자 비번 변경
+        </button>
+        <button onclick="resetAll()" style="background:transparent; color:#EF4444; border:1px solid #FCA5A5; border-radius:8px; padding:9px 12px; font-size:0.8rem; cursor:pointer;" title="모든 회의록과 동대표 명단을 최초 상태로 되돌립니다.">
+          ⚠️ 완전 공장초기화
         </button>
       </div>
     </div>
@@ -1716,14 +1742,42 @@ function promptChangeAdminPw() {
     if (res.error) alert('오류: ' + res.error);
     else {
       adminPw = newPw;
-      sessionStorage.setItem('admin_token', adminPw);
+      saveAdminPw(adminPw);
       alert('관리자 비밀번호가 성공적으로 변경되었습니다!');
     }
   });
 }
 
+function clearAllSignaturesOnly() {
+  if (confirm('【다음 회의 준비 서명 초기화】\n\n✓ 동대표 명단 및 연락처: 그대로 유지\n✓ 각 동대표가 설정한 비밀번호(PIN): 그대로 유지\n\n오직 서명(날인) 데이터만 깨끗이 0명으로 초기화하여 다음 회의를 준비하시겠습니까?')) {
+    fetch('/api/clear-signatures', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Password': adminPw }
+    })
+    .then(r => r.json())
+    .then(res => {
+      alert(res.message || '서명 날인이 초기화되었습니다.');
+      loadAdminData();
+    });
+  }
+}
+
+function resetAllPins() {
+  if (confirm('【동대표 비밀번호 전체 초기화】\n\n모든 동대표의 비밀번호를 관리사무소에 등록된 휴대폰 번호 뒷 4자리로 일괄 초기화하시겠습니까?')) {
+    fetch('/api/reset-all-pins', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Password': adminPw }
+    })
+    .then(r => r.json())
+    .then(res => {
+      alert(res.message || '비밀번호가 초기화되었습니다.');
+      loadAdminData();
+    });
+  }
+}
+
 function resetAll() {
-  if (confirm('모든 서명 데이터를 초기화하시겠습니까?')) {
+  if (confirm('⚠️ 경고: 회의록과 동대표 명단 및 서명을 포함한 모든 데이터가 최초 기본 상태로 되돌아갑니다. 정말 초기화하시겠습니까?')) {
     fetch('/api/reset', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Admin-Password': adminPw }
@@ -1731,7 +1785,7 @@ function resetAll() {
     .then(r => r.json())
     .then(() => {
       loadAdminData();
-      alert('초기화 완료되었습니다.');
+      alert('시스템이 완전 초기화되었습니다.');
     });
   }
 }
